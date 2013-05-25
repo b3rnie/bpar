@@ -1,0 +1,8 @@
+{application, bpar,
+ [ {description,  "bpar"}
+ , {vsn,          git}
+ , {registered,   []}
+ , {applications, [kernel, stdlib]}
+ , {env,          []}
+ ]
+}.
