@@ -104,6 +104,10 @@ behaviour_info(callbacks) ->
 behaviour_info(_) -> undefined.
 
 %%%_ * Types -----------------------------------------------------------
+-type ref()     :: atom() | pid().
+-type task()    :: any().
+-type options() :: list().
+
 -record(s, { %% user supplied
              mod        = throw('mod')        :: atom()
            , args       = throw('args')       :: list()
@@ -146,45 +150,51 @@ start_link(Reg, Args) ->
 stop(Ref) ->
   gen_server:call(Ref, stop).
 
-%% @doc wait for all tasks to finish, block new tasks.
--spec flush(_) -> ok.
-flush(Pid) ->
-  flush(Pid, ?call_timeout).
+-spec flush(ref()) -> ok.
+flush(Ref) ->
+  flush(Ref, ?call_timeout).
 
--spec flush(_, integer()) -> ok.
-flush(Pid, Timeout) ->
-  gen_server:call(Pid, flush, Timeout).
+-spec flush(ref(), timeout()) -> ok.
+flush(Ref, Timeout) ->
+  gen_server:call(Ref, flush, Timeout).
 
-%% @doc run a task synchronously
--spec run(_, any()) -> maybe(_, _).
+-spec run(ref(), task()) -> maybe(_, _).
 run(Ref, Task) ->
   run(Ref, Task, []).
+
+-spec run(ref(), task(), options()) -> maybe(_, _).
 run(Ref, Task, Options) ->
   run(Ref, Task, Options, ?call_timeout).
 
--spec run(pid(), _, [_], integer()) -> maybe(_, _).
-run(Pid, Task, Options, Timeout) ->
-  make_and_call(run, Pid, Task, Options, Timeout).
+-spec run(ref(), task(), options(), timeout()) -> maybe(_, _).
+run(Ref, Task, Options, Timeout) ->
+  new_task(run, Ref, Task, Options, Timeout).
 
-%% @doc run a task asynchronously
-run_async(Pid, Task) ->
-  run_async(Pid, Task, []).
-run_async(Pid, Task, Options) ->
-  run_async(Pid, Task, Options, ?call_timeout).
+-spec run_async(ref(), task()) -> whynot(_).
+run_async(Ref, Task) ->
+  run_async(Ref, Task, []).
 
--spec run_async(pid(), Task, [_], integer()) -> maybe(Task, _).
-run_async(Pid, Task, Options, Timeout) ->
-  make_and_call(run_async, Pid, Task, Options, Timeout).
+-spec run_async(ref(), task(), options()) -> whynot(_).
+run_async(Ref, Task, Options) ->
+  run_async(Ref, Task, Options, ?call_timeout).
 
-%% @doc run a task asynchronously, block until a worker is available
-run_async_wait(Pid, Task) ->
-  run_async_wait(Pid, Task, []).
-run_async_wait(Pid, Task, Options) ->
-  run_async_wait(Pid, Task, Options, ?call_timeout).
+-spec run_async(ref(), task(), options(), timeout()) -> whynot(_).
+run_async(Ref, Task, Options, Timeout) ->
+  new_task(run_async, Ref, Task, Options, Timeout).
 
--spec run_async_wait(pid(), _, [_], integer()) -> maybe(pid(), _).
-run_async_wait(Pid, Task, Options, Timeout) ->
-  make_and_call(run_async_wait, Pid, Task, Options, Timeout).
+-spec run_async_wait(ref(), task()) -> maybe({ok, pid()}, _).
+run_async_wait(Ref, Task) ->
+  run_async_wait(Ref, Task, []).
+
+-spec run_async_wait(ref(), task(), options()) ->
+                        maybe({ok, pid()}, _).
+run_async_wait(Ref, Task, Options) ->
+  run_async_wait(Ref, Task, Options, ?call_timeout).
+
+-spec run_async_wait(ref(), task(), options(), timeout()) ->
+                        maybe({ok, pid()}, _).
+run_async_wait(Ref, Task, Options, Timeout) ->
+  new_task(run_async_wait, Ref, Task, Options, Timeout).
 
 
 %%%_ * gen_server callbacks --------------------------------------------
@@ -296,7 +306,7 @@ handle_info(Msg, S) ->
   {noreply, S, wait(S#s.expire)}.
 
 %%%_ * Internals -------------------------------------------------------
-make_and_call(Type, Pid, Data, Options0, Timeout) ->
+new_task(Type, Pid, Data, Options0, Timeout) ->
   Options = lists:ukeysort(1, Options0 ++ ?options),
   case lists:all(fun is_valid_option/1, Options) of
     true ->
@@ -361,8 +371,7 @@ remove_from_expire(T, Expire) ->
   case QueueTimeout of
     infinity -> Expire;
     Timeout  ->
-      gb_trees:delete({T#t.start_timestamp +
-                         Timeout, T#t.n}, Expire)
+      gb_trees:delete({T#t.start_timestamp + Timeout, T#t.n}, Expire)
   end.
 
 %%%_ * Internals timeouts/expire ---------------------------------------
