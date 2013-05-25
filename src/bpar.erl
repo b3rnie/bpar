@@ -295,7 +295,7 @@ handle_info({'EXIT', Pid, Rsn}, S) ->
       {value, _T} -> {S#s.free, gb_trees:delete(Pid, S#s.busy)};
       none        -> L = queue:to_list(S#s.free),
                      ?hence(lists:member(Pid, L)),
-                     {queue:from_list(L -- [Pid]), S#s.free}
+                     {queue:from_list(L -- [Pid]), S#s.busy}
     end,
   ?error("worker died: ~p", [Rsn]),
   {stop, Rsn, S#s{free=Free, busy=Busy}};
@@ -438,11 +438,10 @@ run_pool_bif(bpar_bif_fun, Fun) -> Fun().
 -ifdef(TEST).
 
 start_stop_test() ->
-  Args = [{mod, bpar_test_worker}, {args, []}, {size, 8}],
-  {ok, Pid1} = bpar:start(Args),
-  {ok, Pid2} = bpar:start({local, bpar2}, Args),
-  {ok, Pid3} = bpar:start_link(Args),
-  {ok, Pid4} = bpar:start_link({local, bpar4}, Args),
+  {ok, Pid1} = bpar:start(test_worker(8)),
+  {ok, Pid2} = bpar:start({local, bpar2}, test_worker(8)),
+  {ok, Pid3} = bpar:start_link(test_worker(8)),
+  {ok, Pid4} = bpar:start_link({local, bpar4}, test_worker(8)),
   Pid2 = whereis(bpar2),
   Pid4 = whereis(bpar4),
   ok = bpar:stop(Pid1),
@@ -452,26 +451,18 @@ start_stop_test() ->
   ok.
 
 return_values_test() ->
-  Args = [{mod, bpar_test_worker}, {args, []}, {size, 2}],
-  {ok, Pid} = bpar:start_link(Args),
-
+  {ok, Pid} = bpar:start_link(test_worker(2)),
   %% run
   {ok, foo} = bpar:run(Pid, {execute, fun() -> {ok, foo} end}),
   {ok, bar} = bpar:run(Pid, {execute, fun() -> {ok, bar} end}),
-
   %% run_async
-  F1 = fun() -> foo end,
-  F2 = fun() -> bar end,
-  ok = bpar:run_async(Pid, {execute, F1}),
-  ok = bpar:run_async(Pid, {execute, F2}),
-
+  ok = bpar:run_async(Pid, {execute, fun() -> foo end}),
+  ok = bpar:run_async(Pid, {execute, fun() -> bar end}),
   %% run_async_wait
-  F3 = fun() -> baz end,
-  F4 = fun() -> blah end,
-  {ok, WorkerPid1} = bpar:run_async_wait(Pid, {execute, F3}),
-  {ok, WorkerPid2} = bpar:run_async_wait(Pid, {execute, F4}),
-  true = erlang:is_pid(WorkerPid1),
-  true = erlang:is_pid(WorkerPid2),
+  {ok, WPid1} = bpar:run_async_wait(Pid, {execute, fun() -> baz end}),
+  {ok, WPid2} = bpar:run_async_wait(Pid, {execute, fun() -> buz end}),
+  true = erlang:is_pid(WPid1),
+  true = erlang:is_pid(WPid2),
   ok = bpar:stop(Pid),
   ok.
 
@@ -484,8 +475,7 @@ options_test() ->
   ok.
 
 options_queue_timeout_test() ->
-  Args      = [{mod, bpar_test_worker}, {args, []}, {size, 1}],
-  {ok, Pid} = bpar:start_link(Args),
+  {ok, Pid} = bpar:start_link(test_worker(1)),
   Daddy     = self(),
   Task      = fun(Id) -> {execute, fun() -> Daddy ! Id end} end,
 
@@ -516,9 +506,7 @@ options_queue_timeout_test() ->
   ok.
 
 options_caller_alive_test() ->
-  Args = [{mod, bpar_bif_fun}, {size, 1}],
-  {ok, Pid} = bpar:start_link(Args),
-
+  {ok, Pid} = bpar:start_link([{mod, bpar_bif_fun}, {size, 1}]),
   %% make worker busy
   bpar:run_async(Pid, fun() -> timer:sleep(1000) end),
   Daddy = self(),
@@ -536,10 +524,8 @@ options_caller_alive_test() ->
   ok.
 
 flush_test() ->
-  Args       = [{mod, bpar_test_worker}, {args, []}, {size, 2}],
-  {ok, Pid}  = bpar:start_link(Args),
+  {ok, Pid}  = bpar:start_link(test_worker(2)),
   Task       = {execute, fun() -> timer:sleep(1000) end},
-
   ok         = bpar:flush(Pid),
   ok         = bpar:run_async(Pid, Task),
   Pid2 = erlang:spawn_link(fun() -> bpar:flush(Pid, 5000) end),
@@ -567,14 +553,11 @@ queue_full_test() ->
   ok.
 
 stray_messages_test() ->
-  Args      = [{mod, bpar_test_worker}, {args, []}, {size, 8}],
-  {ok, Pid} = bpar:start_link(Args),
-  Task      = {execute, fun() -> {ok, success} end},
-
+  {ok, Pid} = bpar:start_link(test_worker(8)),
   Pid ! oops,
   {links, Middlemen} = erlang:process_info(Pid, links),
   lists:foreach(fun(MM) -> MM ! oops end, Middlemen),
-  {ok, success} = bpar:run(Pid, Task),
+  ok = bpar:run(Pid, {execute, fun() -> ok end}),
   bpar:stop(Pid),
   ok.
 
@@ -584,13 +567,16 @@ bad_cast_test() ->
   until_dead(Pid),
   ok.
 
-worker_crash_test() ->
-  Args      = [{mod, bpar_test_worker}, {args, []}, {size, 8}],
-  {ok, Pid} = bpar:start(Args),
-  Task      = {execute, fun() -> ok end},
+busy_worker_crash_test() ->
+  {ok, Pid}   = bpar:start(test_worker(8)),
+  {ok, _WPid} = bpar:run_async_wait(Pid, {execute, fun() -> exit(die) end}),
+  until_dead(Pid),
+  ok.
 
-  {ok, Worker} = bpar:run_async_wait(Pid, Task),
-  exit(Worker, die),
+free_worker_crash_test() ->
+  {ok, Pid}  = bpar:start(test_worker(8)),
+  {ok, WPid} = bpar:run(Pid, {execute, fun() -> {ok, self()} end}),
+  exit(WPid, die),
   until_dead(Pid),
   ok.
 
@@ -603,10 +589,13 @@ code_change_test() ->
   bpar:stop(Pid),
   ok.
 
-stupid_full_cover_test() ->
+full_cover_test() ->
   _         = bpar:behaviour_info(callbacks),
   undefined = bpar:behaviour_info(blah),
   ok.
+
+test_worker(Size) ->
+  [{mod, bpar_test_worker}, {args, []}, {size, Size}].
 
 until_process_info(Pid, {K, V}) ->
   case erlang:process_info(Pid, K) of
