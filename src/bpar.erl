@@ -90,6 +90,7 @@
 -define(size,         8).
 -define(queue_size,   5000).
 -define(call_timeout, 5000).
+-define(options,      [{caller_alive, false}, {queue_timeout, infinity}]).
 
 -define(is_bif(Cb), (Cb =:= bpar_bif_fun)).
 
@@ -295,29 +296,26 @@ handle_info(Msg, S) ->
   {noreply, S, wait(S#s.expire)}.
 
 %%%_ * Internals -------------------------------------------------------
-make_and_call(Type, Pid, Data, Options, Timeout) ->
-  case try_all(fun do_validate/1, Options) of
-    ok ->
+make_and_call(Type, Pid, Data, Options0, Timeout) ->
+  Options = lists:ukeysort(1, Options0 ++ ?options),
+  case lists:all(fun is_valid_option/1, Options) of
+    true ->
       gen_server:call(
         Pid, {run, #t{ start_timestamp = s2_time:stamp() div 1000
                      , options         = Options
                      , data            = Data
                      , type            = Type
                      }}, Timeout);
-    {error, Rsn} ->
-      {error, Rsn}
+    false ->
+      {error, bad_option}
   end.
 
-do_validate({caller_alive, Bool}) when erlang:is_boolean(Bool)    -> ok;
-do_validate({queue_timeout, N})   when erlang:is_integer(N),N > 0 -> ok;
-do_validate(Option) -> {error, {bad_option, Option}}.
-
-try_all(F, [X|Xs]) ->
-  case F(X) of
-    ok           -> try_all(F, Xs);
-    {error, Rsn} -> {error, Rsn}
-  end;
-try_all(_F, []) -> ok.
+is_valid_option({caller_alive, Bool})
+  when erlang:is_boolean(Bool)             -> true;
+is_valid_option({queue_timeout, infinity}) -> true;
+is_valid_option({queue_timeout, N})
+  when erlang:is_integer(N), N > 0         -> true;
+is_valid_option(_)                         -> false.
 
 %%%_ * Internals enqueue/dequeue  --------------------------------------
 %% Two priority queues (gb_trees) are kept in sync to be able to handle
@@ -332,7 +330,8 @@ try_all(_F, []) -> ok.
 enq_work(#t{ options         = Options
            , start_timestamp = Start
            , n               = N} = Task, Work, Expire) ->
-  case s2_lists:assoc(Options, queue_timeout, infinity) of
+  {ok, QueueTimeout} = s2_lists:assoc(Options, queue_timeout),
+  case QueueTimeout of
     infinity -> {gb_trees:insert(N, Task, Work), Expire};
     Timeout  -> {gb_trees:insert(N, Task, Work),
                  gb_trees:insert({Start + Timeout, N}, N, Expire)}
@@ -347,7 +346,7 @@ deq_work(Work0, Expire0) ->
                , n       = N} = T, Work}
            = gb_trees:take_smallest(Work0),
          Expire = remove_from_expire(T, Expire0),
-         CallerAlive = s2_lists:assoc(Options, caller_alive, false),
+         {ok, CallerAlive} = s2_lists:assoc(Options, caller_alive),
          case {erlang:is_process_alive(Pid), CallerAlive} of
            {false, true} ->
              ?debug("caller not alive, dropping: ~p", [Task]),
@@ -358,7 +357,8 @@ deq_work(Work0, Expire0) ->
   end.
 
 remove_from_expire(T, Expire) ->
-  case s2_lists:assoc(T#t.options, queue_timeout, infinity) of
+  {ok, QueueTimeout} = s2_lists:assoc(T#t.options, queue_timeout),
+  case QueueTimeout of
     infinity -> Expire;
     Timeout  ->
       gb_trees:delete({T#t.start_timestamp +
@@ -473,10 +473,10 @@ return_values_test() ->
 
 options_test() ->
   F = fun(Options) -> bpar:run(dummy, dummy, Options) end,
-  {error, {bad_option, {queue_timeout, 0}}}  = F([{queue_timeout, 0}]),
-  {error, {bad_option, {queue_timeout, -1}}} = F([{queue_timeout, -1}]),
-  {error, {bad_option, {caller_alive, bar}}} = F([{caller_alive, bar}]),
-  {error, {bad_option, {unknown_option, x}}} = F([{unknown_option, x}]),
+  {error, bad_option} = F([{queue_timeout, 0}]),
+  {error, bad_option} = F([{queue_timeout, -1}]),
+  {error, bad_option} = F([{caller_alive, bar}]),
+  {error, bad_option} = F([{unknown_option, x}]),
   ok.
 
 options_queue_timeout_test() ->
