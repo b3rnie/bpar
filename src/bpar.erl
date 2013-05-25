@@ -87,10 +87,9 @@
 
 %%%_* Macros ===========================================================
 %% defaults
--define(size,         8).
--define(queue_size,   5000).
 -define(call_timeout, 5000).
--define(options,      [{caller_alive, false}, {queue_timeout, infinity}]).
+-define(options,      [{caller_alive, false},
+                       {queue_timeout, infinity}]).
 
 -define(is_bif(Cb), (Cb =:= bpar_bif_fun)).
 
@@ -114,24 +113,20 @@ behaviour_info(_) -> undefined.
            , size       = throw('size')       :: integer()
            , queue_size = throw('queue_size') :: integer()
              %% internal
-           , free       = throw('free')       :: queue()   %workers
-           , busy       = gb_trees:empty()    :: list()    %workers
-           , n          = 1                                %counter
-           , work       = gb_trees:empty()                 %queue
-           , expire     = gb_trees:empty()                 %prio queue
-           , flush      = []                  :: list()    %froms
+           , free       = throw('free')       :: queue() %workers
+           , busy       = gb_trees:empty()    :: list()  %workers
+           , n          = 1                   :: _       %req counter
+           , work       = gb_trees:empty()    :: _       %req queue
+           , expire     = gb_trees:empty()    :: _
+           , flush      = []                  :: list()  %froms
            }).
 
--record(t, { %% start of call in ms
-             start_timestamp :: integer()
-             %% options for task
-           , options         :: list()
-           , type            :: run | run_async | run_async_wait
-           , data            :: any()
-             %% request from
-           , from
-             %% request id
-           , n
+-record(t, { ts      = throw('ts')      :: integer()
+           , options = throw('options') :: list()
+           , type    = throw('type')    :: run|run_async|run_async_wait
+           , data    = throw('data')    :: any()
+           , from                       :: any()
+           , n                          :: undefined | integer()
          }).
 
 %%%_ * API -------------------------------------------------------------
@@ -216,9 +211,8 @@ init(Args) ->
 
 terminate(_Rsn, S) ->
   Pids = queue:to_list(S#s.free) ++ gb_trees:keys(S#s.busy),
-  lists:foreach(fun(Pid) -> Pid ! {self(), stop} end, Pids).
-
-code_change(_OldVsn, S, _Extra) -> {ok, S, wait(S#s.expire)}.
+  lists:foreach(fun(Pid) -> Pid ! {self(), stop} end, Pids),
+  lists:foreach(fun(Pid) -> receive {'EXIT', Pid, _} -> ok end end, Pids).
 
 handle_call({run, _}, _From, #s{flush=[_|_]} = S) ->
   {reply, {error, flushing}, S, wait(S#s.expire)};
@@ -264,13 +258,12 @@ handle_call(stop, _From, S) ->
 handle_cast(Msg, S) ->
   {stop, {bad_cast, Msg}, S}.
 
-handle_info({Pid, {done, Res}}, #s{busy = Busy0} = S) ->
-  T    = gb_trees:get(Pid, Busy0),
-  Busy = gb_trees:delete(Pid, Busy0),
+handle_info({Pid, {done, Res}}, S) ->
+  T    = gb_trees:get(Pid, S#s.busy),
+  Busy = gb_trees:delete(Pid, S#s.busy),
   [gen_server:reply(T#t.from, Res) || T#t.type =:= run],
   case deq_work(S#s.work, S#s.expire) of
     {{value, TNext}, Work, Expire} ->
-      ?debug("~p starting ~p", [Pid, TNext]),
       Pid ! {self(), {run, TNext#t.data}},
       [gen_server:reply(TNext#t.from, {ok, Pid}) ||
         TNext#t.type =:= run_async_wait],
@@ -290,20 +283,29 @@ handle_info({Pid, {done, Res}}, #s{busy = Busy0} = S) ->
                    }, infinity}
   end;
 
-handle_info(timeout, #s{work = Work0, expire = Expire0} = S) ->
-  {Work, Expire} = do_expire(s2_time:stamp() div 1000, Work0, Expire0),
+handle_info(timeout, S) ->
+  {Work, Expire} = do_expire(s2_time:stamp() div 1000,
+                             S#s.work,
+                             S#s.expire),
   {noreply, S#s{work = Work, expire = Expire}, wait(Expire)};
 
 handle_info({'EXIT', Pid, Rsn}, S) ->
-  %% TODO: Handle worker crasches
-  Pids = queue:to_list(S#s.free) ++ gb_trees:keys(S#s.busy),
-  ?hence(lists:member(Pid, Pids)),
+  {Free, Busy} =
+    case gb_trees:lookup(Pid, S#s.busy) of
+      {value, _T} -> {S#s.free, gb_trees:delete(Pid, S#s.busy)};
+      none        -> L = queue:to_list(S#s.free),
+                     ?hence(lists:member(Pid, L)),
+                     {queue:from_list(L -- [Pid]), S#s.free}
+    end,
   ?error("worker died: ~p", [Rsn]),
-  {stop, Rsn, S};
+  {stop, Rsn, S#s{free=Free, busy=Busy}};
 
 handle_info(Msg, S) ->
   ?warning("~p", [Msg]),
   {noreply, S, wait(S#s.expire)}.
+
+code_change(_OldVsn, S, _Extra) ->
+  {ok, S, wait(S#s.expire)}.
 
 %%%_ * Internals -------------------------------------------------------
 new_task(Type, Pid, Data, Options0, Timeout) ->
@@ -311,10 +313,10 @@ new_task(Type, Pid, Data, Options0, Timeout) ->
   case lists:all(fun is_valid_option/1, Options) of
     true ->
       gen_server:call(
-        Pid, {run, #t{ start_timestamp = s2_time:stamp() div 1000
-                     , options         = Options
-                     , data            = Data
-                     , type            = Type
+        Pid, {run, #t{ ts      = s2_time:stamp() div 1000
+                     , options = Options
+                     , data    = Data
+                     , type    = Type
                      }}, Timeout);
     false ->
       {error, bad_option}
@@ -337,41 +339,34 @@ is_valid_option(_)                         -> false.
 %%
 %% Picking the next task to run or expire is then a O(log N)
 %% operation.
-enq_work(#t{ options         = Options
-           , start_timestamp = Start
-           , n               = N} = Task, Work, Expire) ->
-  {ok, QueueTimeout} = s2_lists:assoc(Options, queue_timeout),
-  case QueueTimeout of
-    infinity -> {gb_trees:insert(N, Task, Work), Expire};
-    Timeout  -> {gb_trees:insert(N, Task, Work),
-                 gb_trees:insert({Start + Timeout, N}, N, Expire)}
+enq_work(#t{n=N} = T, Work, Expire) ->
+  case s2_lists:assoc(T#t.options, queue_timeout) of
+    {ok, infinity} -> {gb_trees:insert(N, T, Work), Expire};
+    {ok, Timeout}  -> {gb_trees:insert(N, T, Work),
+                       gb_trees:insert({T#t.ts + Timeout, N}, N, Expire)}
   end.
 
 deq_work(Work0, Expire0) ->
   ?hence(gb_trees:size(Work0) >= gb_trees:size(Expire0)),
   case gb_trees:size(Work0) of
     0 -> {empty, Work0, Expire0};
-    _ -> {N, #t{ options = Options
-               , from    = {Pid, _}
-               , n       = N} = T, Work}
-           = gb_trees:take_smallest(Work0),
-         Expire = remove_from_expire(T, Expire0),
-         {ok, CallerAlive} = s2_lists:assoc(Options, caller_alive),
-         case {erlang:is_process_alive(Pid), CallerAlive} of
-           {false, true} ->
+    _ -> {N, #t{n=N} = T, Work} = gb_trees:take_smallest(Work0),
+         Expire            = remove_from_expire(T, Expire0),
+         {ok, CallerAlive} = s2_lists:assoc(T#t.options, caller_alive),
+         {Pid, _}          = T#t.from,
+         PidAlive          = erlang:is_process_alive(Pid),
+         if CallerAlive, not PidAlive ->
              ?debug("caller not alive, dropping: ~p", [Task]),
              deq_work(Work, Expire);
-           _ ->
+            true ->
              {{value, T}, Work, Expire}
          end
   end.
 
 remove_from_expire(T, Expire) ->
-  {ok, QueueTimeout} = s2_lists:assoc(T#t.options, queue_timeout),
-  case QueueTimeout of
-    infinity -> Expire;
-    Timeout  ->
-      gb_trees:delete({T#t.start_timestamp + Timeout, T#t.n}, Expire)
+  case s2_lists:assoc(T#t.options, queue_timeout) of
+    {ok, infinity} -> Expire;
+    {ok, Timeout}  -> gb_trees:delete({T#t.ts + Timeout, T#t.n}, Expire)
   end.
 
 %%%_ * Internals timeouts/expire ---------------------------------------
