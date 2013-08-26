@@ -69,7 +69,7 @@
 -define(commands, 100).
 sequential_test() ->
   ?assert(proper:quickcheck(
-            tulib_pool_proper_test:prop_sequential(), ?commands)).
+            bpar_proper_test:prop_sequential(), ?commands)).
 
 
 prop_sequential() ->
@@ -77,10 +77,10 @@ prop_sequential() ->
           ?TRAPEXIT(
              begin
                {ok, Pid1} = start_link(),
-               {ok, Pid2} = tulib_pool:start_link({local, tulib_pool},
-                                                  start_pool_args()),
+               {ok, Pid2} = bpar:start_link({local, bpar},
+                                            start_pool_args()),
                {H, S, Res} = run_commands(?MODULE, Cmds),
-               ok = tulib_pool:stop(tulib_pool),
+               ok = bpar:stop(bpar),
                wait_for_pid_death(Pid2),
                ok = stop(),
                wait_for_pid_death(Pid1),
@@ -92,7 +92,7 @@ prop_sequential() ->
 wait_for_pid_death(Pid) ->
   lists:member(Pid, processes()) andalso wait_for_pid_death(Pid).
 
-initial_state() -> #s{pid=tulib_pool, v=0}.
+initial_state() -> #s{pid=bpar, v=0}.
 
 command(#s{pid=Pid} = _S) ->
   %% TODO:
@@ -119,36 +119,36 @@ precondition(_S,                  {call, _, _,          _}) -> true.
 
 %%%_ * Actions ---------------------------------------------------------
 start_pool_args() ->
-  [ {cbmod,          tulib_pool_test_worker}
-  , {args,           []}
-  , {size,           8}
-  , {max_queue_size, infinity}
+  [ {mod,        bpar_test_worker}
+  , {args,       []}
+  , {size,       8}
+  , {queue_size, infinity}
   ].
 
 run(Pid, N) ->
-  _ = tulib_pool:run(Pid, inctask(N)).
+  bpar:run(Pid, inctask(N)).
 
 run_async(Pid, N) ->
-  _ = tulib_pool:run_async(Pid, inctask(N)).
+  bpar:run_async(Pid, inctask(N)).
 
 run_async_wait(Pid, N) ->
-  _ = tulib_pool:run_async_wait(Pid, inctask(N)).
+  bpar:run_async_wait(Pid, inctask(N)).
 
 run_timeout(Pid, _N, Timeout) ->
-  _ = tulib_pool:run(Pid, dummytask(5), [{queue_timeout, Timeout}]).
+  bpar:run(Pid, dummytask(5), [{queue_timeout, Timeout}]).
 
 run_async_timeout(Pid, _N, Timeout) ->
-  _ = tulib_pool:run_async(Pid, dummytask(5), [{queue_timeout, Timeout}]).
+  bpar:run_async(Pid, dummytask(5), [{queue_timeout, Timeout}]).
 
 run_async_wait_timeout(Pid, _N, Timeout) ->
-  _ = tulib_pool:run_async_wait(
-        Pid, dummytask(5), [{queue_timeout, Timeout}]).
+  bpar:run_async_wait(
+    Pid, dummytask(5), [{queue_timeout, Timeout}]).
 
 run_async_not_alive(Pid, _N, _Timeout) ->
-  _ = tulib_pool:run_async(Pid, dummytask(5), [{caller_alive, false}]).
+  bpar:run_async(Pid, dummytask(5), [{caller_alive, false}]).
 
 flush(Pid) ->
-  tulib_pool:flush(Pid).
+  bpar:flush(Pid).
 
 inctask(N) ->
   {execute, fun() -> inc(N) end}.
