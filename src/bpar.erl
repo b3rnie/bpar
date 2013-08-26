@@ -116,8 +116,8 @@ behaviour_info(_) -> undefined.
            , free       = throw('free')       :: queue() %workers
            , busy       = gb_trees:empty()    :: list()  %workers
            , n          = 1                   :: _       %req counter
-           , work       = gb_trees:empty()    :: _       %req queue
-           , expire     = gb_trees:empty()    :: _
+           , work       = throw('work')       :: _       %req queue
+           , expire     = throw('expire')     :: _
            , flush      = []                  :: list()  %froms
            }).
 
@@ -207,6 +207,8 @@ init(Args) ->
          , size       = Size
          , queue_size = QueueSize
          , free       = Free
+         , work       = ets:new(?MODULE, [ordered_set, private])
+         , expire     = ets:new(?MODULE, [ordered_set, private])
          }}.
 
 terminate(_Rsn, S) ->
@@ -222,7 +224,7 @@ handle_call({run, T0}, From, S) ->
   case queue:out(S#s.free) of
     {{value, Pid}, Free} ->
       %% free worker
-      ?hence(gb_trees:size(S#s.work) =:= 0),
+      ?hence(ets_len(S#s.work) =:= 0),
       Pid ! {self(), {run, T#t.data}},
       [gen_server:reply(From, ok)        || T#t.type =:= run_async],
       [gen_server:reply(From, {ok, Pid}) || T#t.type =:= run_async_wait],
@@ -232,22 +234,20 @@ handle_call({run, T0}, From, S) ->
                    }};
     {empty, _Free} ->
       %% no free workers
-      case gb_trees:size(S#s.work) >= S#s.queue_size of
-        true  -> {reply, {error, queue_full}, S, wait(S#s.expire)};
+      case ets_len(S#s.work) >= S#s.queue_size of
+        true  ->
+          {reply, {error, queue_full}, S, wait(S#s.expire)};
         false ->
-          {Work, Expire} = enq_work(T, S#s.work, S#s.expire),
+          enq_work(T, S#s.work, S#s.expire),
           [gen_server:reply(From, ok) || T#t.type =:= run_async],
-          {noreply, S#s{ n      = S#s.n+1
-                       , work   = Work
-                       , expire = Expire
-                       }, wait(Expire)}
+          {noreply, S#s{n=S#s.n+1}, wait(S#s.expire)}
       end
   end;
 
 handle_call(flush, From, S) ->
   case gb_trees:size(S#s.busy) of
-    0 -> ?hence(gb_trees:size(S#s.work) =:= 0),
-         ?hence(gb_trees:size(S#s.expire) =:= 0),
+    0 -> ?hence(ets_len(S#s.work) =:= 0),
+         ?hence(ets_len(S#s.expire) =:= 0),
          {reply, ok, S};
     _ -> {noreply, S#s{flush=[From|S#s.flush]}, wait(S#s.expire)}
   end;
@@ -263,39 +263,33 @@ handle_info({Pid, {done, Res}}, S) ->
   Busy = gb_trees:delete(Pid, S#s.busy),
   [gen_server:reply(T#t.from, Res) || T#t.type =:= run],
   case deq_work(S#s.work, S#s.expire) of
-    {{value, TNext}, Work, Expire} ->
+    {ok, TNext} ->
       Pid ! {self(), {run, TNext#t.data}},
       [gen_server:reply(TNext#t.from, {ok, Pid}) ||
         TNext#t.type =:= run_async_wait],
-      {noreply, S#s{ work   = Work
-                   , expire = Expire
-                   , busy   = gb_trees:insert(Pid, TNext, Busy)
-                   }, wait(Expire)};
-    {empty, Work, Expire} ->
+      {noreply, S#s{busy=gb_trees:insert(Pid, TNext, Busy)
+                   }, wait(S#s.expire)};
+    {error, empty} ->
       lists:foreach(fun(From) ->
                         gen_server:reply(From, ok)
                     end, S#s.flush),
       {noreply, S#s{ busy   = Busy
                    , free   = queue:in(Pid, S#s.free)
                    , flush  = []
-                   , work   = Work
-                   , expire = Expire
                    }, infinity}
   end;
 
 handle_info(timeout, S) ->
-  {Work, Expire} = do_expire(s2_time:stamp() div 1000,
-                             S#s.work,
-                             S#s.expire),
-  {noreply, S#s{work = Work, expire = Expire}, wait(Expire)};
+  do_expire(s2_time:stamp() div 1000, S#s.work, S#s.expire),
+  {noreply, S, wait(S#s.expire)};
 
 handle_info({'EXIT', Pid, Rsn}, S) ->
   {Free, Busy} =
     case gb_trees:lookup(Pid, S#s.busy) of
       {value, _T} -> {S#s.free, gb_trees:delete(Pid, S#s.busy)};
-      none        -> L = queue:to_list(S#s.free),
-                     ?hence(lists:member(Pid, L)),
-                     {queue:from_list(L -- [Pid]), S#s.busy}
+      none        ->  L = queue:to_list(S#s.free),
+                      ?hence(lists:member(Pid, L)),
+                      {queue:from_list(L -- [Pid]), S#s.busy}
     end,
   ?error("worker died: ~p", [Rsn]),
   {stop, Rsn, S#s{free=Free, busy=Busy}};
@@ -341,60 +335,59 @@ is_valid_option(_)                         -> false.
 %% operation.
 enq_work(#t{n=N} = T, Work, Expire) ->
   case s2_lists:assoc(T#t.options, queue_timeout) of
-    {ok, infinity} -> {gb_trees:insert(N, T, Work), Expire};
-    {ok, Timeout}  -> {gb_trees:insert(N, T, Work),
-                       gb_trees:insert({T#t.ts + Timeout, N}, N, Expire)}
+    {ok, infinity} -> ?hence(ets:insert_new(Work, {N, T}));
+    {ok, Timeout}  -> ?hence(ets:insert_new(Work, {N, T})),
+                      ?hence(ets:insert_new(Expire, {{T#t.ts + Timeout, N}, N}))
   end.
 
-deq_work(Work0, Expire0) ->
-  ?hence(gb_trees:size(Work0) >= gb_trees:size(Expire0)),
-  case gb_trees:size(Work0) of
-    0 -> {empty, Work0, Expire0};
-    _ -> {N, #t{n=N} = T, Work} = gb_trees:take_smallest(Work0),
-         Expire            = remove_from_expire(T, Expire0),
-         {ok, CallerAlive} = s2_lists:assoc(T#t.options, caller_alive),
-         {Pid, _}          = T#t.from,
-         PidAlive          = erlang:is_process_alive(Pid),
-         if CallerAlive, not PidAlive ->
-             ?debug("caller not alive, dropping: ~p", [Task]),
-             deq_work(Work, Expire);
-            true ->
-             {{value, T}, Work, Expire}
-         end
+deq_work(Work, Expire) ->
+  ?hence(ets_len(Work) >= ets_len(Expire)),
+  case ets:first(Work) of
+    '$end_of_table' ->
+      {error, empty};
+    N ->
+      [{N,#t{n=N}=T}] = ets:lookup(Work, N),
+      true = ets:delete(Work, N),
+      case s2_lists:assoc(T#t.options, queue_timeout) of
+        {ok, infinity} -> ok;
+        {ok, Timeout}  -> true = ets:delete(Expire, {T#t.ts + Timeout, T#t.n})
+      end,
+      {ok, CallerAlive} = s2_lists:assoc(T#t.options, caller_alive),
+      {Pid, _}          = T#t.from,
+      PidAlive          = erlang:is_process_alive(Pid),
+      if CallerAlive, not PidAlive ->
+          ?debug("caller not alive, dropping: ~p", [Task]),
+          deq_work(Work, Expire);
+         true ->
+          {ok, T}
+      end
   end.
 
-remove_from_expire(T, Expire) ->
-  case s2_lists:assoc(T#t.options, queue_timeout) of
-    {ok, infinity} -> Expire;
-    {ok, Timeout}  -> gb_trees:delete({T#t.ts + Timeout, T#t.n}, Expire)
-  end.
+ets_len(Tab) ->
+  {ok, Len} = s2_lists:assoc(ets:info(Tab), size),
+  Len.
 
 %%%_ * Internals timeouts/expire ---------------------------------------
 %% @doc ms's until next task expire
 wait(Expire) ->
-  case gb_trees:size(Expire) of
-    0 -> infinity;
-    _ -> {{Timeout, N}, N} = gb_trees:smallest(Expire),
-         ?hence(erlang:is_integer(Timeout)),
-         ?hence(erlang:is_integer(N)),
-         lists:max([Timeout - (s2_time:stamp() div 1000), 0])
+  case ets:first(Expire) of
+    '$end_of_table' -> infinity;
+    {Timeout, _N}   -> lists:max([Timeout - (s2_time:stamp() div 1000), 0])
   end.
 
 %% @doc expire expired tasks.
-do_expire(Now, Work0, Expire0) ->
-  case gb_trees:size(Expire0) of
-    0 -> {Work0, Expire0};
-    _ -> case gb_trees:take_smallest(Expire0) of
-           {{Timeout, N}, N, Expire} when Timeout =< Now ->
-             Work = gb_trees:delete(N, Work0),
-             T    = gb_trees:get(N, Work0),
-             [gen_server:reply(T#t.from, {error, timeout}) ||
-               T#t.type =:= run orelse
-               T#t.type =:= run_async_wait],
-             do_expire(Now, Work, Expire);
-           {{_Timeout, _N}, _N, _Expire} ->
-             {Work0, Expire0}
-         end
+do_expire(Now, Work, Expire) ->
+  case ets:first(Expire) of
+    '$end_of_table' -> ok;
+    {Timeout, _N}
+      when Timeout > Now -> ok;
+    {Timeout, N} ->
+      [{N,T}] = ets:lookup(Work, N),
+      ets:delete(Work, N),
+      ets:delete(Expire, {Timeout, N}),
+      [gen_server:reply(T#t.from, {error, timeout}) ||
+        T#t.type =:= run orelse T#t.type =:= run_async_wait],
+      do_expire(Now, Work, Expire)
   end.
 
 %%%_ * Internals Worker related ----------------------------------------
